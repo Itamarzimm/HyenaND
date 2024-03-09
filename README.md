@@ -18,7 +18,13 @@
 - pip install pandas
 
 ## Training:
+Hyena-DeiT:
+
 python main.py --model deit_tiny_patch16_224 --batch-size 256 --seed 0 --method hyena2d --directional_mode seq --hyena2d_filter --data-set CELEB --bce-loss --epochs 20 --warmup-epochs 1
+
+Hyena-DeiT Hybrid:
+
+python main.py --model deit_tiny_patch16_224 --batch-size 256 --seed 0 --method hyena2dattn --directional_mode seq --hyena2d_filter --data-set CELEB --bce-loss --epochs 20 --warmup-epochs 1
 
 ## Acknowledgement:
 This repository is heavily based on [DEIT](https://github.com/facebookresearch/deit) and [Hyena](https://github.com/HazyResearch/safari). Thanks for their wonderful works.
