@@ -34,7 +34,7 @@ import torch.nn.functional as F
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD
 from .helpers import build_model_with_cfg, named_apply, adapt_input_conv
-from .layers import PatchEmbed, Mlp, DropPath, trunc_normal_, lecun_normal_
+from .layers import HyenaOperator2d, HyenaOperator, PatchEmbed, Mlp, DropPath, EarlyConvs, trunc_normal_, lecun_normal_
 from .registry import register_model
 
 _logger = logging.getLogger(__name__)
@@ -168,10 +168,12 @@ default_cfgs = {
     ),
 }
 
-
+from torch.utils.checkpoint import checkpoint
 class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0., grad_cp = False):
         super().__init__()
+        print("create attention with grad_cp:",grad_cp)
+        self.grad_cp = grad_cp 
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.scale = head_dim ** -0.5
@@ -182,6 +184,25 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(self, x):
+        # B, N, C = x.shape
+        # qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        # q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
+
+        # attn = (q @ k.transpose(-2, -1)) * self.scale
+        # attn = attn.softmax(dim=-1)
+        # attn = self.attn_drop(attn)
+
+        # x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+
+        if self.grad_cp:
+            x = checkpoint(self.forward_features, x)
+        else:
+            x = self.forward_features(x)
+        
+        x = self.proj_drop(x)
+        return x
+    
+    def forward_features(self, x):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
@@ -192,17 +213,41 @@ class Attention(nn.Module):
 
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
-        x = self.proj_drop(x)
+        # x = self.proj_drop(x)
         return x
 
 
 class Block(nn.Module):
 
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, num_patches=0, args=None, block_idx = 0 , depth = 1, grad_cp=False):
         super().__init__()
+        print("Create ViT Block with method={}, dim={}, num_heads={} ,".format(args.method, dim, num_heads))
         self.norm1 = norm_layer(dim)
-        self.attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
+        # attnhyena2d,hyena2dattn,onebyone
+        if args.method == "attnhyena2d":
+            self.method = 'hyena2d' if (block_idx > (depth//2)) else 'attention'
+        elif args.method == "hyena2dattn":
+            self.method = 'attention' if (block_idx > (depth//2)) else 'hyena2d'
+        elif args.method == "onebyone":
+            self.method = 'hyena2d' if ((block_idx % 2) == 0) else 'attention'
+        else:
+            self.method = args.method
+
+        if self.method == 'hyena2d':
+            if args.directional_mode == "seq":
+                self.directional_mode = "seq" if ((block_idx % 2) == 0) else "standard"
+            else:
+                self.directional_mode = args.directional_mode
+        if self.method == "attention" or self.method == "attentionec":
+            self.attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop, grad_cp=grad_cp)
+        elif self.method == "hyena":
+            self.attn = HyenaOperator(d_model=dim,l_max=num_patches,order=args.hyena_order,filter_order=args.hyena_filter_order,dropout=drop,filter_dropout=attn_drop)
+        elif self.method == "hyena2d":
+            self.attn = HyenaOperator2d(d_model=dim,l_max=int(num_patches**0.5),order=args.hyena_order,filter_order=args.hyena_filter_order,dropout=drop,filter_dropout=attn_drop, hyena2d_filter=args.hyena2d_filter, sqrt_decay=args.hyena2d_sqrt_decay, directional_mode = self.directional_mode, direct_paramtrization=args.direct_paramtrization, window_mode=args.window_mode)
+        else:
+            raise NotImplementedError("method shpuld be in [hyena,hyena2d,attention]")
+
         # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
@@ -210,7 +255,11 @@ class Block(nn.Module):
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
     def forward(self, x):
-        x = x + self.drop_path(self.attn(self.norm1(x)))
+        x_skip = x
+        x = self.norm1(x)
+        x = self.attn(x)
+        x = x_skip + self.drop_path(x)
+        #x = x + self.drop_path(self.attn(self.norm1(x)))
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
 
@@ -228,7 +277,7 @@ class VisionTransformer(nn.Module):
     def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, embed_dim=768, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=True, representation_size=None, distilled=False,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0., embed_layer=PatchEmbed, norm_layer=None,
-                 act_layer=None, weight_init=''):
+                 act_layer=None, weight_init='', args=None):
         """
         Args:
             img_size (int, tuple): input image size
@@ -250,17 +299,27 @@ class VisionTransformer(nn.Module):
             weight_init: (str): weight init scheme
         """
         super().__init__()
+        self.early_conv = (args.method == "attentionec")
+        if self.early_conv:
+            self.convs = EarlyConvs(channels=in_chans, dim=embed_dim)
+            print("!early conv")
+            depth = depth - 1 
+        self.grad_cp = args.grad_cp
+        patch_size = args.patch_size
+        self.args = args
+        self.use_cls_token = args.use_cls_token
         self.num_classes = num_classes
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
-        self.num_tokens = 2 if distilled else 1
+        self.num_tokens = 1 if self.use_cls_token else 0 #2 if distilled else 1
         norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
         act_layer = act_layer or nn.GELU
 
         self.patch_embed = embed_layer(
             img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
         num_patches = self.patch_embed.num_patches
-
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.num_patches = num_patches
+        if self.use_cls_token:
+            self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.dist_token = nn.Parameter(torch.zeros(1, 1, embed_dim)) if distilled else None
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + self.num_tokens, embed_dim))
         self.pos_drop = nn.Dropout(p=drop_rate)
@@ -269,7 +328,7 @@ class VisionTransformer(nn.Module):
         self.blocks = nn.Sequential(*[
             Block(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, drop=drop_rate,
-                attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, act_layer=act_layer)
+                attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, act_layer=act_layer, num_patches=self.num_patches, args=args, block_idx = i , depth = depth, grad_cp=args.grad_cp)
             for i in range(depth)])
         self.norm = norm_layer(embed_dim)
 
@@ -290,7 +349,9 @@ class VisionTransformer(nn.Module):
             self.head_dist = nn.Linear(self.embed_dim, self.num_classes) if num_classes > 0 else nn.Identity()
 
         self.init_weights(weight_init)
-
+        print("Create VisionTransformer with img_size={}, patch_size={} , embed_dim= {}, num_classes = {}".format(img_size,patch_size,embed_dim,num_classes))
+        print("use_cls_token={} , num_patches={}".format(args.use_cls_token,self.num_patches))
+        print("drops: attn_drop_rate ={} , drop_rate={}".format(attn_drop_rate,drop_rate))
     def init_weights(self, mode=''):
         assert mode in ('jax', 'jax_nlhb', 'nlhb', '')
         head_bias = -math.log(self.num_classes) if 'nlhb' in mode else 0.
@@ -301,7 +362,8 @@ class VisionTransformer(nn.Module):
             # leave cls token as zeros to match jax impl
             named_apply(partial(_init_vit_weights, head_bias=head_bias, jax_impl=True), self)
         else:
-            trunc_normal_(self.cls_token, std=.02)
+            if self.use_cls_token:
+                trunc_normal_(self.cls_token, std=.02)
             self.apply(_init_vit_weights)
 
     def _init_weights(self, m):
@@ -329,14 +391,19 @@ class VisionTransformer(nn.Module):
             self.head_dist = nn.Linear(self.embed_dim, self.num_classes) if num_classes > 0 else nn.Identity()
 
     def forward_features(self, x):
-        x = self.patch_embed(x)
-        cls_token = self.cls_token.expand(x.shape[0], -1, -1)  # stole cls_tokens impl from Phil Wang, thanks
-        if self.dist_token is None:
-            x = torch.cat((cls_token, x), dim=1)
+        if self.early_conv:
+            x = self.convs(x)
         else:
-            x = torch.cat((cls_token, self.dist_token.expand(x.shape[0], -1, -1), x), dim=1)
+            x = self.patch_embed(x)
+        if self.use_cls_token:
+            cls_token = self.cls_token.expand(x.shape[0], -1, -1)  # stole cls_tokens impl from Phil Wang, thanks
+            if self.dist_token is None:
+                x = torch.cat((cls_token, x), dim=1)
+            else:
+                x = torch.cat((cls_token, self.dist_token.expand(x.shape[0], -1, -1), x), dim=1)
         x = self.pos_drop(x + self.pos_embed)
-        x = self.blocks(x)
+        x = self.blocks(x) 
+            
         x = self.norm(x)
         if self.dist_token is None:
             return self.pre_logits(x[:, 0])
@@ -763,7 +830,6 @@ def vit_huge_patch14_224_in21k(pretrained=False, **kwargs):
         patch_size=14, embed_dim=1280, depth=32, num_heads=16, representation_size=1280, **kwargs)
     model = _create_vision_transformer('vit_huge_patch14_224_in21k', pretrained=pretrained, **model_kwargs)
     return model
-
 
 @register_model
 def deit_tiny_patch16_224(pretrained=False, **kwargs):

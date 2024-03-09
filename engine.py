@@ -33,7 +33,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
     for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
         samples = samples.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
-
+        
         if mixup_fn is not None:
             samples, targets = mixup_fn(samples, targets)
             
@@ -41,14 +41,13 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
             samples = torch.cat((samples,samples),dim=0)
             
         if args.bce_loss:
-            targets = targets.gt(0.0).type(targets.dtype)
+            targets = targets.gt(0.0).type(targets.dtype).float()
          
         with torch.cuda.amp.autocast():
             outputs = model(samples)
             if not args.cosub:
                 loss = criterion(samples, outputs, targets)
             else:
-                outputs = torch.split(outputs, outputs.shape[0]//2, dim=0)
                 loss = 0.25 * criterion(outputs[0], targets) 
                 loss = loss + 0.25 * criterion(outputs[1], targets) 
                 loss = loss + 0.25 * criterion(outputs[0], outputs[1].detach().sigmoid())
@@ -80,7 +79,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
 
 
 @torch.no_grad()
-def evaluate(data_loader, model, device):
+def evaluate(data_loader, model, device, args=None):
     criterion = torch.nn.CrossEntropyLoss()
 
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -92,14 +91,26 @@ def evaluate(data_loader, model, device):
     for images, target in metric_logger.log_every(data_loader, 10, header):
         images = images.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
+        if args is not None:
+            if args.data_set == "CELEB":
+                target = target.float()
+            else:
+                images = images.float().to(device)
+                target = target.long().to(device) 
 
         # compute output
         with torch.cuda.amp.autocast():
             output = model(images)
             loss = criterion(output, target)
 
-        acc1, acc5 = accuracy(output, target, topk=(1, 5))
 
+        #acc1, acc5 = accuracy(output, target, topk=(1, 5))
+        if args.data_set == "CELEB":
+            pred = (output > 0)
+            acc1 = ((pred == target).sum() / (pred.numel()))
+            acc5  = acc1*0 
+        else:
+            acc1, acc5 = accuracy(output, target, topk=(1, 5))
         batch_size = images.shape[0]
         metric_logger.update(loss=loss.item())
         metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)

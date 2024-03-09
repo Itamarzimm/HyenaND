@@ -22,11 +22,12 @@ from engine import train_one_epoch, evaluate
 from losses import DistillationLoss
 from samplers import RASampler
 from augment import new_data_aug_generator
-
+from torch.utils.data import random_split
 import models
 import models_v2
 
 import utils
+
 
 
 def get_args_parser():
@@ -156,7 +157,7 @@ def get_args_parser():
     # Dataset parameters
     parser.add_argument('--data-path', default='/datasets01/imagenet_full_size/061417/', type=str,
                         help='dataset path')
-    parser.add_argument('--data-set', default='IMNET', choices=['CIFAR', 'IMNET', 'INAT', 'INAT19'],
+    parser.add_argument('--data-set', default='CELEB', choices=['CELEB' ,'CIFAR', 'IMNET', 'INAT', 'INAT19','IMNET100'],
                         type=str, help='Image Net dataset path')
     parser.add_argument('--inat-category', default='name',
                         choices=['kingdom', 'phylum', 'class', 'order', 'supercategory', 'family', 'genus', 'name'],
@@ -185,13 +186,43 @@ def get_args_parser():
     parser.add_argument('--world_size', default=1, type=int,
                         help='number of distributed processes')
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
+    
+    parser.add_argument('--debug_small_dataset', action='store_true', help='yes for clrml')
+    parser.add_argument('--dp', action='store_true', help='yes for clrml')
+
+    parser.add_argument('--subset_data', default=1.0, type=float, help='Random Erasing probability')
+
+    parser.add_argument('--method', default='attention', choices=['attention', 'hyena', 'hyena2d', 'onebyone' , 'hyena2dattn' ,'attnhyena2d','attentionec'], type=str, help='TBD')
+
+    parser.add_argument('--use_cls_token',  action='store_true', help='TBD') 
+
+    parser.add_argument('--hyena_filter_order',  type=int, default=64, help='TBD')
+
+    parser.add_argument('--hyena_order',  type=int, default=2, help='TBD')
+
+    parser.add_argument('--hyena2d_filter',  action='store_true', help='TBD') 
+
+    parser.add_argument('--hyena2d_sqrt_decay',  action='store_true', help='TBD') 
+
+    parser.add_argument('--directional_mode', default='standard', choices=['standard', 'seq', 'parallel', '4dir' ,'4dirp'], type=str, help='TBD')
+
+    parser.add_argument('--direct_paramtrization', action='store_true', help='TBD')
+
+    parser.add_argument('--window_mode', default='standard', choices=['standard', 'learn', 'symettric', 'no'], type=str, help='TBD')
+    
+    parser.add_argument('--patch_size',  type=int, default=16, help='TBD')
+
+    parser.add_argument('--grad_accum',  type=int, default=0, help='TBD')
+
+    parser.add_argument('--grad_cp',  action='store_true', help='TBD') 
+    
     return parser
 
 
 def main(args):
     utils.init_distributed_mode(args)
-
     print(args)
+
 
     if args.distillation_type != 'none' and args.finetune and not args.eval:
         raise NotImplementedError("Finetuning with distillation not yet supported")
@@ -205,11 +236,27 @@ def main(args):
     # random.seed(seed)
 
     cudnn.benchmark = True
+    if args.data_set != "CELEB":
+        dataset_train, args.nb_classes = build_dataset(is_train=True, args=args)
+        dataset_val, _ = build_dataset(is_train=False, args=args)
+        if args.data_set == "IMNET100":
+            args.nb_classes = 100
+    else:
+        from datasets import build_transform
+        from celeba import get_dataset
+        dataset_train, dataset_val, dataset_test  = get_dataset(build_transform(True,args),build_transform(False,args))
+        args.nb_classes = 40
 
-    dataset_train, args.nb_classes = build_dataset(is_train=True, args=args)
-    dataset_val, _ = build_dataset(is_train=False, args=args)
+    # if args.debug_small_dataset:
+    #     a = int(0.05 * len(dataset_train))
+    #     b = len(dataset_train) -a
+    #     dataset_train, _  = random_split(dataset_train, [a,b])
+    # if args.subset_data > 0.0 :
+    #     a = int(args.subset_data * len(dataset_train))
+    #     b = len(dataset_train) -a
+    #     dataset_train, _  = random_split(dataset_train, [a,b])
 
-    if args.distributed:
+    if True:#args.distributed:
         num_tasks = utils.get_world_size()
         global_rank = utils.get_rank()
         if args.repeated_aug:
@@ -229,10 +276,12 @@ def main(args):
                 dataset_val, num_replicas=num_tasks, rank=global_rank, shuffle=False)
         else:
             sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+            if args.data_set == "CELEB":
+                sampler_test = torch.utils.data.SequentialSampler(dataset_test)
     else:
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
-
+        
     data_loader_train = torch.utils.data.DataLoader(
         dataset_train, sampler=sampler_train,
         batch_size=args.batch_size,
@@ -250,14 +299,24 @@ def main(args):
         pin_memory=args.pin_mem,
         drop_last=False
     )
+    if args.data_set == "CELEB":
+        data_loader_test = torch.utils.data.DataLoader(
+            dataset_test, sampler=sampler_test,
+            batch_size=int(1.5 * args.batch_size),
+            num_workers=args.num_workers,
+            pin_memory=args.pin_mem,
+            drop_last=False
+        )
 
     mixup_fn = None
-    mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
-    if mixup_active:
-        mixup_fn = Mixup(
-            mixup_alpha=args.mixup, cutmix_alpha=args.cutmix, cutmix_minmax=args.cutmix_minmax,
-            prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
-            label_smoothing=args.smoothing, num_classes=args.nb_classes)
+    if args.data_set != "CELEB":
+        mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
+        if mixup_active:
+            mixup_fn = Mixup(
+                mixup_alpha=args.mixup, cutmix_alpha=args.cutmix, cutmix_minmax=args.cutmix_minmax,
+                prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
+                label_smoothing=args.smoothing, num_classes=args.nb_classes)
+    else : mixup_active = False
 
     print(f"Creating model: {args.model}")
     model = create_model(
@@ -267,10 +326,13 @@ def main(args):
         drop_rate=args.drop,
         drop_path_rate=args.drop_path,
         drop_block_rate=None,
-        img_size=args.input_size
+        img_size=args.input_size,
+        args=args
     )
+    model.head = torch.nn.Linear(model.head.weight.shape[1],args.nb_classes)
+    print(model)
+  
 
-                    
     if args.finetune:
         if args.finetune.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(
@@ -344,6 +406,9 @@ def main(args):
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         model_without_ddp = model.module
+    if args.dp:
+        model = torch.nn.DataParallel(model)
+        model_without_ddp = model.module
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
     if not args.unscale_lr:
@@ -376,6 +441,7 @@ def main(args):
             pretrained=False,
             num_classes=args.nb_classes,
             global_pool='avg',
+            patch_size=8
         )
         if args.teacher_path.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(
@@ -409,9 +475,15 @@ def main(args):
             if 'scaler' in checkpoint:
                 loss_scaler.load_state_dict(checkpoint['scaler'])
         lr_scheduler.step(args.start_epoch)
+
     if args.eval:
-        test_stats = evaluate(data_loader_val, model, device)
+        test_stats = evaluate(data_loader_val, model, device, args)
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+        if args.data_set == "CELEB":
+            test_stats = evaluate(data_loader_test, model, device, args)
+            print("Test:")
+            print(f"Accuracy of the network on the {len(dataset_test)} test images: {test_stats['acc1']:.1f}%")
+        
         return
 
     print(f"Start training for {args.epochs} epochs")
@@ -430,27 +502,10 @@ def main(args):
         )
 
         lr_scheduler.step(epoch)
-        if args.output_dir:
-            checkpoint_paths = [output_dir / 'checkpoint.pth']
-            for checkpoint_path in checkpoint_paths:
-                utils.save_on_master({
-                    'model': model_without_ddp.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'lr_scheduler': lr_scheduler.state_dict(),
-                    'epoch': epoch,
-                    'model_ema': get_state_dict(model_ema),
-                    'scaler': loss_scaler.state_dict(),
-                    'args': args,
-                }, checkpoint_path)
-             
-
-        test_stats = evaluate(data_loader_val, model, device)
-        print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
-        
-        if max_accuracy < test_stats["acc1"]:
-            max_accuracy = test_stats["acc1"]
+        save_cp = True
+        if save_cp:
             if args.output_dir:
-                checkpoint_paths = [output_dir / 'best_checkpoint.pth']
+                checkpoint_paths = [output_dir / 'checkpoint.pth']
                 for checkpoint_path in checkpoint_paths:
                     utils.save_on_master({
                         'model': model_without_ddp.state_dict(),
@@ -461,15 +516,40 @@ def main(args):
                         'scaler': loss_scaler.state_dict(),
                         'args': args,
                     }, checkpoint_path)
+                
+
+        test_stats = evaluate(data_loader_val, model, device, args)
+        print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+        
+        save_cp = True
+        if max_accuracy < test_stats["acc1"]:
+            max_accuracy = test_stats["acc1"]
+            if save_cp:
+                if args.output_dir:
+                    checkpoint_paths = [output_dir / 'best_checkpoint.pth']
+                    for checkpoint_path in checkpoint_paths:
+                        utils.save_on_master({
+                            'model': model_without_ddp.state_dict(),
+                            'optimizer': optimizer.state_dict(),
+                            'lr_scheduler': lr_scheduler.state_dict(),
+                            'epoch': epoch,
+                            'model_ema': get_state_dict(model_ema),
+                            'scaler': loss_scaler.state_dict(),
+                            'args': args,
+                        }, checkpoint_path)
             
         print(f'Max accuracy: {max_accuracy:.2f}%')
 
+        test_stats = evaluate(data_loader_val, model, device, args)
+        print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+        if args.data_set == "CELEB":
+            test_test_stats = evaluate(data_loader_test, model, device, args)
+            print(f"Accuracy test of the network on the {len(dataset_test)} test images: {test_test_stats['acc1']:.1f}%")
+        
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      **{f'test_{k}': v for k, v in test_stats.items()},
                      'epoch': epoch,
                      'n_parameters': n_parameters}
-        
-        
         
         
         if args.output_dir and utils.is_main_process():
@@ -479,7 +559,6 @@ def main(args):
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
-
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('DeiT training and evaluation script', parents=[get_args_parser()])
