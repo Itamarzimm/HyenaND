@@ -12,7 +12,7 @@
 - pip install torch==1.13.1+cu116 torchvision==0.14.1+cu116 --extra-index-url https://download.pytorch.org/whl/cu116
 
 - git clone git@github.com:Itamarzimm/HyenaND.git 
-- cd pytorch-image-models
+- cd pytorch-image-models (based on "git clone https://github.com/rwightman/pytorch-image-models.git --branch v0.4.12 --depth 1")
 - pip install -e .
 - pip install einops
 - pip install pandas
